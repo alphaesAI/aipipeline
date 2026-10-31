@@ -1,0 +1,32 @@
+id: dicom_processor
+namespace: default
+
+tasks:
+  - id: process_dicom
+    type: io.kestra.plugin.scripts.python.Script
+    pythonVersion: "3.11"
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+      image: python:3.11-slim
+    namespaceFiles:
+      enabled: true
+    outputFiles:
+      - metadata.json
+    beforeCommands:
+      - pip install pydicom
+    script: |
+      import pydicom
+      import json
+
+      ds = pydicom.dcmread("dicomfile.DCM")
+
+      data = {
+          "patient_name": str(getattr(ds, 'PatientName', 'N/A')),
+          "modality": str(getattr(ds, 'Modality', 'N/A')),
+          "image_size": f"{ds.Rows}x{ds.Columns}"
+      }
+
+      with open("metadata.json", "w") as f:
+          json.dump(data, f)
+          
+      print("Namespace DICOM processed successfully!")

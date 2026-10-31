@@ -1,0 +1,17 @@
+id: pdf_text_extractor
+namespace: default
+description: "extract text from a pdf file and store the output"
+
+tasks:
+  - id: download_sample_pdf
+    type: io.kestra.plugin.core.http.Download
+    uri: https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf
+
+  - id: extract_text
+    type: io.kestra.plugin.pdfbox.text.Extract
+    from: "{{ outputs.download_sample_pdf.uri }}"
+
+  - id: store_extracted_text
+    type: io.kestra.plugin.core.storage.Write
+    extension: txt
+    content: "{{ outputs.extract_text.text }}"

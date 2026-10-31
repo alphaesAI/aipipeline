@@ -1,0 +1,45 @@
+id: sample
+namespace: default
+description: "Asset trigger: check fhir-staging for pending records and trigger filenest_asset_consumer flow"
+
+inputs:
+  - id: fhir_staging_base_url
+    type: STRING
+    defaults: "http://host.docker.internal:8002"
+    description: "Base URL for fhir-staging service"
+
+triggers:
+  - id: schedule_every_minute
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 0 * * *"
+
+tasks:
+  - id: check_pending_records
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ inputs.fhir_staging_base_url }}/api/v1/staging-records/?status=pending"
+    method: GET
+    contentType: application/json
+    options:
+      allowFailed: true
+
+  - id: parse_response
+    type: io.kestra.plugin.scripts.python.Script
+    dependencies:
+      - kestra
+    inputFiles:
+      response.json: "{{ outputs.check_pending_records.body }}"
+    script: |
+      import json
+      from kestra import Kestra
+
+      with open("response.json", "r") as f:
+          data = json.load(f)
+      
+      count = len(data.get("data", []))
+      print(f"Found {count} pending record(s)")
+      
+      Kestra.outputs({"count": count})
+
+  - id: log_result
+    type: io.kestra.plugin.core.log.Log
+    message: "Processed {{ outputs.parse_response.vars.count }} pending record(s)"
