@@ -1,0 +1,366 @@
+id: medical
+namespace: default
+description: "Medical processing pipeline: checks fhir-staging for pending records, processes PDF and DICOM documents across granular tasks, and maps observations back"
+inputs:
+  - id: fhir_staging_base_url
+    type: STRING
+    defaults: "{{ kv('FHIR_STAGING_BASE_URL') }}"
+    description: Base URL for fhir-staging service
+  - id: filenest_api_url
+    type: STRING
+    defaults: "{{ kv('FILENEST_API_URL') }}"
+    description: Base URL for FileNest service
+  - id: filenest_api_key
+    type: STRING
+    defaults: "{{ kv('FILENEST_API_KEY') }}"
+    description: FileNest API Key
+  - id: filenest_project_id
+    type: STRING
+    defaults: "{{ kv('FILENEST_PROJECT_ID') }}"
+    description: FileNest Project ID
+  - id: openai_api_key
+    type: STRING
+    defaults: "{{ kv('OPENAI_API_KEY') }}"
+    description: OpenAI API Key (optional override; falls back to environment)
+triggers:
+  - id: schedule_every_day
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: 0 0 * * *
+tasks:
+  - id: check_pending_records
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ inputs.fhir_staging_base_url }}/api/v1/staging-records/?status=pending"
+    method: GET
+    contentType: application/json
+    options:
+      allowFailed: true
+  - id: parse_and_log_records
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    inputFiles:
+      response.json: "{{ outputs.check_pending_records.body }}"
+    script: |
+      import json
+      from kestra import Kestra
+
+      with open("response.json", "r", encoding="utf-8") as f:
+          content = f.read().strip()
+          try:
+              data = json.loads(content) if content else {}
+          except Exception:
+              data = {}
+
+      records = data.get("data", []) if isinstance(data, dict) else []
+      print(f"Retrieved {len(records)} pending record(s) from fhir-staging")
+
+      target_records = []
+      for r in records:
+          staging_id = r.get("staging_record_id") or r.get("id")
+          file_id = r.get("file_id")
+          filename = r.get("attachment_title") or file_id or "document"
+          content_type = (r.get("attachment_content_type") or r.get("content_type") or "").lower()
+
+          name_lower = filename.lower()
+          is_pdf = name_lower.endswith(".pdf") or "pdf" in content_type
+          is_dicom = name_lower.endswith((".dcm", ".dicom")) or "dicom" in content_type
+
+          if staging_id and (is_pdf or is_dicom):
+              target_records.append({
+                  "staging_record_id": str(staging_id),
+                  "file_id": str(file_id or ""),
+                  "filename": filename,
+                  "is_dicom": str(is_dicom).lower(),
+                  "is_pdf": str(is_pdf).lower(),
+                  "patient_id": r.get("patient_id"),
+                  "encounter_id": r.get("encounter_id"),
+                  "service_request_id": r.get("service_request_id"),
+              })
+              print(f"Target record queued: staging_id={staging_id}, file_id={file_id}, is_dicom={is_dicom}, filename={filename}")
+
+      Kestra.outputs({
+          "target_records": target_records,
+          "has_records": len(target_records) > 0,
+      })
+  - id: log_result
+    type: io.kestra.plugin.core.log.Log
+    message: Found {{ outputs.parse_and_log_records.vars.target_records | length }} target PDF/DICOM record(s) to process
+  - id: process_records_loop
+    type: io.kestra.plugin.core.flow.Loop
+    values: "{{ outputs.parse_and_log_records.vars.target_records }}"
+    tasks:
+      - id: update_status_to_processing
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ inputs.fhir_staging_base_url }}/api/v1/staging-records/{{ fromJson(item.value).staging_record_id }}"
+        method: PATCH
+        contentType: application/json
+        body: |
+          {
+            "status": "processing",
+            "updated_by": "kestra-medical"
+          }
+      - id: download_file
+        type: io.kestra.plugin.scripts.python.Script
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        env:
+          FHIR_STAGING_BASE_URL: "{{ inputs.fhir_staging_base_url }}"
+          FILENEST_API_KEY: "{{ inputs.filenest_api_key }}"
+          FILENEST_PROJECT_ID: "{{ inputs.filenest_project_id }}"
+          FILENEST_API_URL: "{{ inputs.filenest_api_url }}"
+          STAGING_RECORD_ID: "{{ fromJson(item.value).staging_record_id }}"
+          ITEM_FILE_ID: "{{ fromJson(item.value).file_id }}"
+          ITEM_FILENAME: "{{ fromJson(item.value).filename }}"
+          ITEM_PATIENT_ID: "{{ fromJson(item.value).patient_id }}"
+        script: |
+          import os
+          import sys
+          from pathlib import Path
+          from kestra import Kestra
+
+          AI_PLATFORM = Path("/home/logidhasan/data/github/drgodly/aipipeline")
+          if str(AI_PLATFORM) not in sys.path:
+              sys.path.insert(0, str(AI_PLATFORM))
+
+          from src.components.connectors.factory import ConnectorFactory
+          from src.components.extractors.factory import ExtractorFactory
+          from src.components.fhir_staging.client import FhirStagingClient
+
+          staging_base_url = os.getenv("FHIR_STAGING_BASE_URL")
+          staging_record_id = int(os.getenv("STAGING_RECORD_ID"))
+
+          with FhirStagingClient(base_url=staging_base_url) as staging_client:
+              record_details = staging_client.get_staging_record(staging_record_id)
+
+          file_id = record_details.get("file_id") or os.getenv("ITEM_FILE_ID")
+          filename = (
+              record_details.get("attachment_title")
+              or record_details.get("filename")
+              or os.getenv("ITEM_FILENAME")
+          )
+          
+          print(f"Staging record {staging_record_id}: file_id={file_id}, filename={filename}")
+
+          filenest_conn = ConnectorFactory.get_connector(
+              "filenest",
+              {
+                  "api_key": os.getenv("FILENEST_API_KEY"),
+                  "project_id": os.getenv("FILENEST_PROJECT_ID"),
+                  "base_url": os.getenv("FILENEST_API_URL"),
+              },
+          )
+
+          download_dir = AI_PLATFORM / "storage" / "temp"
+          download_dir.mkdir(parents=True, exist_ok=True)
+
+          downloader = ExtractorFactory.get_extractor(
+              "filenest",
+              connection=filenest_conn,
+              config={"download_dir": str(download_dir)},
+          )
+
+          local_path = downloader.download_to_temp(
+              file_id,
+              filename=filename,
+          )
+          print(f"Downloaded to: {local_path}")
+          Kestra.outputs({
+              "local_path": str(local_path),
+              "file_id": file_id,
+              "filename": filename,
+              "patient_id": record_details.get("patient_id") or os.getenv("ITEM_PATIENT_ID"),
+          })
+      - id: extract_document_content
+        type: io.kestra.plugin.scripts.python.Script
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        env:
+          IS_DICOM: "{{ fromJson(item.value).is_dicom }}"
+          LOCAL_PATH: "{{ outputs.download_file.vars.local_path }}"
+        script: |
+          import os
+          import json
+          import sys
+          from pathlib import Path
+          from kestra import Kestra
+
+          AI_PLATFORM = Path("/home/logidhasan/data/github/drgodly/aipipeline")
+          if str(AI_PLATFORM) not in sys.path:
+              sys.path.insert(0, str(AI_PLATFORM))
+
+          from src.components.extractors.factory import ExtractorFactory
+          from src.components.utils.config import PipelineConfig
+
+          settings = PipelineConfig()
+          filepath = Path(os.getenv("LOCAL_PATH"))
+          is_dicom = os.getenv("IS_DICOM").lower() == "true" or filepath.suffix.lower() in (".dcm", ".dicom")
+
+          if is_dicom:
+              print(f"Running DICOM extraction for {filepath.name}")
+              extractor = ExtractorFactory.get_extractor(
+                  "dicom",
+                  config={
+                      "output_image_dir": str(settings.EXTRACTED_IMAGE_DIR),
+                      "extract_preview": True,
+                  },
+              )
+              extracted = extractor.extract(str(filepath))
+              dicom_metadata = getattr(extracted, "dicom_metadata", None) or {}
+          else:
+              print(f"Running PDF extraction for {filepath.name}")
+              extractor = ExtractorFactory.get_extractor(
+                  "pdf",
+                  config=settings.get_extractor_config(),
+              )
+              extracted = extractor.extract(str(filepath))
+              dicom_metadata = None
+
+          print(f"Extraction completed: {len(extracted.markdown)} markdown chars")
+          Kestra.outputs({
+              "markdown": extracted.markdown,
+              "is_dicom": is_dicom,
+              "dicom_metadata": dicom_metadata,
+          })
+      - id: classify_document
+        type: io.kestra.plugin.scripts.python.Script
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        env:
+          OPENAI_API_KEY: "{{ inputs.openai_api_key }}"
+          EXTRACTED_MARKDOWN: "{{ outputs.extract_document_content.vars.markdown }}"
+        script: |
+          import asyncio
+          import os
+          import sys
+          from pathlib import Path
+          from kestra import Kestra
+
+          AI_PLATFORM =Path("/home/logidhasan/data/github/drgodly/aipipeline")
+          if str(AI_PLATFORM) not in sys.path:
+              sys.path.insert(0, str(AI_PLATFORM))
+
+          from src.components.transformers.factory import TransformerFactory
+          from src.components.utils.config import PipelineConfig
+
+          api_key = os.getenv("OPENAI_API_KEY") or PipelineConfig().OPENAI_API_KEY
+          classifier = TransformerFactory.get_transformer(
+              "medical_classifier",
+              config={"api_key": api_key, "model": "gpt-4o-mini"},
+          )
+
+          markdown = os.getenv("EXTRACTED_MARKDOWN")
+          report_type = asyncio.run(classifier.classify(markdown))
+          print(f"Report classified as: {report_type}")
+          Kestra.outputs({"report_type": report_type})
+      - id: transform_clinical_domain
+        type: io.kestra.plugin.scripts.python.Script
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        env:
+          OPENAI_API_KEY: "{{ inputs.openai_api_key }}"
+          EXTRACTED_MARKDOWN: "{{ outputs.extract_document_content.vars.markdown }}"
+          DICOM_METADATA_JSON: "{{ outputs.extract_document_content.vars.dicom_metadata | json }}"
+          REPORT_TYPE: "{{ outputs.classify_document.vars.report_type }}"
+          FILE_ID: "{{ outputs.download_file.vars.file_id }}"
+          FILENAME: "{{ outputs.download_file.vars.filename }}"
+          PATIENT_ID: "{{ outputs.download_file.vars.patient_id }}"
+        outputFiles:
+          - clinical_document.json
+        script: |
+          import asyncio
+          import json
+          import os
+          import sys
+          from pathlib import Path
+          from kestra import Kestra
+
+          AI_PLATFORM = Path("/home/logidhasan/data/github/drgodly/aipipeline")
+          if str(AI_PLATFORM) not in sys.path:
+              sys.path.insert(0, str(AI_PLATFORM))
+
+          from src.components.transformers.factory import TransformerFactory
+          from src.components.fhir_staging.mapper import StagingObservationMapper
+          from src.components.utils.config import PipelineConfig
+
+          settings = PipelineConfig()
+          api_key = os.getenv("OPENAI_API_KEY") or settings.OPENAI_API_KEY
+
+          transformer_config = settings.get_transformer_config()
+          transformer_config["api_key"] = api_key
+          transformer = TransformerFactory.get_transformer("medical", config=transformer_config)
+
+          markdown = os.getenv("EXTRACTED_MARKDOWN")
+          dicom_meta_raw = os.getenv("DICOM_METADATA_JSON")
+          dicom_metadata = json.loads(dicom_meta_raw) if dicom_meta_raw else None
+
+          document = asyncio.run(transformer.transform(markdown, dicom_metadata=dicom_metadata))
+          filename = os.getenv("FILENAME")
+          file_id = os.getenv("FILE_ID")
+          patient_id = os.getenv("PATIENT_ID")
+
+          document["report_type"] = os.getenv("REPORT_TYPE")
+          document["source_file"] = filename
+          document["filenest_file_id"] = file_id
+          document["patient_id"] = patient_id
+
+          out_dir = AI_PLATFORM / "storage" / "emr" / "transformed"
+          out_dir.mkdir(parents=True, exist_ok=True)
+          file_id_short = file_id[:8] if file_id else "unknown"
+          out_path = out_dir / f"{Path(filename).stem}_{file_id_short}.json"
+
+          doc_json = json.dumps(document, indent=2, ensure_ascii=False, default=str)
+          out_path.write_text(doc_json, encoding="utf-8")
+
+          with open("clinical_document.json", "w", encoding="utf-8") as f:
+              f.write(doc_json)
+
+          mapper = StagingObservationMapper()
+          mapped_observations = [
+              mapper.map(obs) for obs in document.get("observations", []) if isinstance(obs, dict)
+          ]
+
+          print(f"Persisted to {out_path} with {len(mapped_observations)} observations")
+          Kestra.outputs({
+              "output_path": str(out_path),
+              "summary": document.get("summary", ""),
+              "observations": mapped_observations,
+          })
+      - id: patch_staging_completed
+        type: io.kestra.plugin.scripts.python.Script
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        env:
+          STAGING_RECORD_ID: "{{ fromJson(item.value).staging_record_id }}"
+          FHIR_STAGING_BASE_URL: "{{ inputs.fhir_staging_base_url }}"
+          SUMMARY: "{{ outputs.transform_clinical_domain.vars.summary }}"
+          OBSERVATIONS_JSON: "{{ outputs.transform_clinical_domain.vars.observations | json }}"
+        script: |
+          import os
+          import requests
+          import json
+          
+          staging_id = os.getenv("STAGING_RECORD_ID")
+          base_url = os.getenv("FHIR_STAGING_BASE_URL").rstrip("/")
+          summary = os.getenv("SUMMARY")
+          obs_raw = os.getenv("OBSERVATIONS_JSON")
+          observations = json.loads(obs_raw) if obs_raw else []
+
+          payload = {
+              "status": "completed",
+              "updated_by": "kestra-medical",
+              "summary": summary,
+              "observations": observations
+          }
+          resp = requests.patch(
+              f"{base_url}/api/v1/staging-records/{staging_id}",
+              json=payload
+          )
+          print(f"Patched record {staging_id} to completed: HTTP {resp.status_code}")
+      - id: cleanup_temp_file
+        type: io.kestra.plugin.scripts.shell.Commands
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        env:
+          LOCAL_PATH: "{{ outputs.download_file.vars.local_path }}"
+        commands:
+          - rm -f '$LOCAL_PATH'
