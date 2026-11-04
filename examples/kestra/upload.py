@@ -12,11 +12,11 @@ fn = FileNest(
 )
 
 # Example: Uploading a file
-with open("/home/logidhasan/Documents/filenest_reports/sample_heart.pdf", "rb") as f:
+with open("/home/logidhasan/Documents/filenest_reports/sample_dicom.DCM", "rb") as f:
     file = fn.files.upload(
         data=f,
-        filename="sample_heart.pdf",
-        mime_type="application/pdf"
+        filename="sample_dicom.DCM",
+        mime_type="application/dicom"a
     )
 
 print("Uploaded file ID:", file.id)

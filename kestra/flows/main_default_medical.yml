@@ -205,7 +205,9 @@ tasks:
                   },
               )
               extracted = extractor.extract(str(filepath))
-              dicom_metadata = getattr(extracted, "dicom_metadata", None) or {}
+              raw_metadata = getattr(extracted, "dicom_metadata", None) or {}
+              # Convert pydicom MultiValue and other non-standard types to primitive JSON types
+              dicom_metadata = json.loads(json.dumps(raw_metadata, default=str))
           else:
               print(f"Running PDF extraction for {filepath.name}")
               extractor = ExtractorFactory.get_extractor(
