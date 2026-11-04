@@ -118,7 +118,7 @@ tasks:
           from pathlib import Path
           from kestra import Kestra
 
-          AI_PLATFORM = Path("/home/logidhasan/data/github/drgodly/aipipeline")
+          AI_PLATFORM = Path("/app/aipipeline")
           if str(AI_PLATFORM) not in sys.path:
               sys.path.insert(0, str(AI_PLATFORM))
 
@@ -184,7 +184,7 @@ tasks:
           from pathlib import Path
           from kestra import Kestra
 
-          AI_PLATFORM = Path("/home/logidhasan/data/github/drgodly/aipipeline")
+          AI_PLATFORM = Path("/app/aipipeline")
           if str(AI_PLATFORM) not in sys.path:
               sys.path.insert(0, str(AI_PLATFORM))
 
@@ -235,7 +235,7 @@ tasks:
           from pathlib import Path
           from kestra import Kestra
 
-          AI_PLATFORM =Path("/home/logidhasan/data/github/drgodly/aipipeline")
+          AI_PLATFORM =Path("/app/aipipeline")
           if str(AI_PLATFORM) not in sys.path:
               sys.path.insert(0, str(AI_PLATFORM))
 
@@ -259,7 +259,7 @@ tasks:
         env:
           OPENAI_API_KEY: "{{ inputs.openai_api_key }}"
           EXTRACTED_MARKDOWN: "{{ outputs.extract_document_content.vars.markdown }}"
-          DICOM_METADATA_JSON: "{{ outputs.extract_document_content.vars.dicom_metadata | json }}"
+          DICOM_METADATA_JSON: "{{ outputs.extract_document_content.vars.dicom_metadata | toJson }}"
           REPORT_TYPE: "{{ outputs.classify_document.vars.report_type }}"
           FILE_ID: "{{ outputs.download_file.vars.file_id }}"
           FILENAME: "{{ outputs.download_file.vars.filename }}"
@@ -274,7 +274,7 @@ tasks:
           from pathlib import Path
           from kestra import Kestra
 
-          AI_PLATFORM = Path("/home/logidhasan/data/github/drgodly/aipipeline")
+          AI_PLATFORM = Path("/app/aipipeline")
           if str(AI_PLATFORM) not in sys.path:
               sys.path.insert(0, str(AI_PLATFORM))
 
@@ -333,7 +333,7 @@ tasks:
           STAGING_RECORD_ID: "{{ fromJson(item.value).staging_record_id }}"
           FHIR_STAGING_BASE_URL: "{{ inputs.fhir_staging_base_url }}"
           SUMMARY: "{{ outputs.transform_clinical_domain.vars.summary }}"
-          OBSERVATIONS_JSON: "{{ outputs.transform_clinical_domain.vars.observations | json }}"
+          OBSERVATIONS_JSON: "{{ outputs.transform_clinical_domain.vars.observations | toJson }}"
         script: |
           import os
           import requests
