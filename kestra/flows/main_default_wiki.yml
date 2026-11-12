@@ -1,0 +1,332 @@
+id: wiki
+namespace: default
+
+description: >
+  Wiki Pipeline: NAS watch -> PDF extract -> LLM classify -> LLM transform ->
+  Wiki Generator -> Metadata Index -> Knowledge Graph Builder.
+
+# -------------------------------------------------------------------
+# Pipeline Configuration defined via Flow Variables
+# -------------------------------------------------------------------
+variables:
+  nas:
+    directory: "/home/kipla/aipipeline/aiplatform/storage/raw"
+    allowed_extensions: [".pdf", ".dcm"]
+    stability_delay_seconds: 1.0
+    stability_retries: 5
+
+  extraction:
+    extract_images: true
+    image_output_dir: "/home/kipla/aipipeline/aiplatform/storage/images"
+
+  classification:
+    model: "gpt-4o-mini"
+    prompt_file: "prompts/report_classification.md"
+
+  transformation:
+    model: "gpt-4o-mini"
+    prompt_file: "prompts/clinical_extraction.md"
+
+  image_analysis:
+    model: "gpt-4o"
+    prompt_file: "prompts/image_analysis.md"
+
+  wiki:
+    output_dir: "/home/kipla/aipipeline/aiplatform/storage/wiki"
+    consolidate_medications: true
+    create_report_dirs_on_demand: true
+
+  metadata:
+    backend: "json"
+    index_path: "/home/kipla/aipipeline/aiplatform/storage/metadata/index.json"
+
+  graph:
+    engine: "graphifyy"
+
+  neo4j:
+    uri: "bolt://localhost:7687"
+    username: "neo4j"
+    password: "password123"
+    database: "neo4j"
+
+tasks:
+  # -------------------------------------------------------------------
+  # Step 1: Scan NAS Directory for New PDFs
+  # -------------------------------------------------------------------
+  - id: scan_nas_task
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    env:
+      NAS_CONFIG: "{{ vars.nas | json }}"
+      WIKI_CONFIG: "{{ vars.wiki | json }}"
+    script: |
+      import sys
+      import json
+      import logging
+      import asyncio
+      import os
+      from pathlib import Path
+
+      _AI_PLATFORM = Path("/app/aipipeline")
+      if str(_AI_PLATFORM) not in sys.path:
+          sys.path.insert(0, str(_AI_PLATFORM))
+
+      from src.components.connectors.nas import NASConnector
+
+      logger = logging.getLogger(__name__)
+
+      def _get_processed_files(wiki_dir: str) -> set:
+          import re
+          log = Path(wiki_dir) / "log.md"
+          if not log.exists():
+              return set()
+          text = log.read_text(encoding="utf-8")
+          return set(re.findall(r"\*\*Source File:\*\*\s*\n\s*\n\s+(.+)", text))
+
+      nas_cfg = json.loads(os.environ["NAS_CONFIG"])
+      wiki_cfg = json.loads(os.environ["WIKI_CONFIG"])
+
+      pdf_dir = Path(nas_cfg.get("directory", "/app/aipipeline/data/storage/pdf"))
+      wiki_dir = wiki_cfg.get("output_dir", "/app/aipipeline/data/storage/wiki")
+      ext = nas_cfg.get("allowed_extensions", [".pdf"])
+      config = {"nas_dir_path": str(pdf_dir), "allowed_extensions": ext}
+
+      connector = NASConnector(config)
+
+      async def _run():
+          session = await connector.connect()
+          return [f for f in session.get_new_files()]
+
+      all_files = asyncio.run(_run())
+      processed = _get_processed_files(wiki_dir)
+      new_files = [f for f in all_files if f.name not in processed]
+      skipped = len(all_files) - len(new_files)
+      logger.info(f"Found {len(all_files)} PDF(s), {skipped} already processed, {len(new_files)} new")
+
+      file_paths = [str(f) for f in new_files]
+
+      with open("new_files.json", "w") as f:
+          json.dump(file_paths, f)
+    outputFiles:
+      - new_files.json
+
+  # -------------------------------------------------------------------
+  # Step 2: Extract PDF & Classify Document Content
+  # -------------------------------------------------------------------
+  - id: extract_and_classify_task
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    env:
+      OPENAI_API_KEY: "{{ secret('OPENAI_API_KEY') }}"
+      EXTRACTION_CONFIG: "{{ vars.extraction | json }}"
+      CLASSIFICATION_CONFIG: "{{ vars.classification | json }}"
+      IMAGE_ANALYSIS_CONFIG: "{{ vars.image_analysis | json }}"
+    inputFiles:
+      new_files.json: "{{ outputs.scan_nas_task.outputFiles['new_files.json'] }}"
+    script: |
+      import sys
+      import json
+      import logging
+      import asyncio
+      import os
+      from pathlib import Path
+
+      _AI_PLATFORM = Path("/app/aipipeline")
+      if str(_AI_PLATFORM) not in sys.path:
+          sys.path.insert(0, str(_AI_PLATFORM))
+
+      from src.components.extractors.pymu_extractor import PyMuPdfExtractor
+      from src.components.extractors.image_analyzer import ImageAnalyzer
+      from src.components.transformers.medical_classifier import MedicalClassifier
+
+      logger = logging.getLogger(__name__)
+
+      with open("new_files.json", "r") as f:
+          file_paths = json.load(f)
+
+      if not file_paths:
+          logger.info("No new PDFs — skipping downstream extraction.")
+          documents = []
+      else:
+          ext_cfg = json.loads(os.environ["EXTRACTION_CONFIG"])
+          cls_cfg = json.loads(os.environ["CLASSIFICATION_CONFIG"])
+          img_cfg = json.loads(os.environ["IMAGE_ANALYSIS_CONFIG"])
+
+          api_key = os.environ.get("OPENAI_API_KEY")
+
+          extractor = PyMuPdfExtractor({
+              "extract_images": ext_cfg.get("extract_images", True),
+              "output_image_dir": ext_cfg.get("image_output_dir", "storage/images")
+          })
+
+          async def _run():
+              classifier = MedicalClassifier({"api_key": api_key, "model": cls_cfg.get("model", "gpt-4o-mini")})
+              image_analyzer = ImageAnalyzer({"api_key": api_key, "model": img_cfg.get("model", "gpt-4o")})
+              docs = []
+              for fp in file_paths:
+                  logger.info(f"Extracting: {fp}")
+                  extracted = extractor.extract(fp)
+                  text = extracted.markdown
+                  if extracted.images:
+                      desc = await image_analyzer.extract(extracted.images)
+                      text = desc + "\n\n" + text
+                  report_type = await classifier.classify(extracted.markdown)
+                  docs.append({
+                      "filepath": fp,
+                      "text": text,
+                      "report_type": report_type,
+                      "images": extracted.images
+                  })
+              return docs
+
+          documents = asyncio.run(_run())
+
+      with open("documents.json", "w") as f:
+          json.dump(documents, f)
+    outputFiles:
+      - documents.json
+
+  # -------------------------------------------------------------------
+  # Step 3: Transform Raw Document Text to Structured Schema
+  # -------------------------------------------------------------------
+  - id: transform_documents_task
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    env:
+      OPENAI_API_KEY: "{{ secret('OPENAI_API_KEY') }}"
+      TRANSFORMATION_CONFIG: "{{ vars.transformation | json }}"
+    inputFiles:
+      documents.json: "{{ outputs.extract_and_classify_task.outputFiles['documents.json'] }}"
+    script: |
+      import sys
+      import json
+      import logging
+      import asyncio
+      import os
+      import hashlib
+      from pathlib import Path
+
+      _AI_PLATFORM = Path("/app/aipipeline")
+      if str(_AI_PLATFORM) not in sys.path:
+          sys.path.insert(0, str(_AI_PLATFORM))
+
+      from src.components.transformers.medical_transformer import MedicalTransformer
+
+      logger = logging.getLogger(__name__)
+
+      with open("documents.json", "r") as f:
+          docs = json.load(f)
+
+      if not docs:
+          results = []
+      else:
+          trans_cfg = json.loads(os.environ["TRANSFORMATION_CONFIG"])
+          api_key = os.environ.get("OPENAI_API_KEY")
+          transformer = MedicalTransformer({"api_key": api_key, "model": trans_cfg.get("model", "gpt-4o-mini")})
+
+          async def _run():
+              transformed_results = []
+              for d in docs:
+                  structured = await transformer.transform(d["text"])
+                  h = hashlib.sha256(Path(d["filepath"]).name.encode()).hexdigest()[:12]
+                  structured["document_id"] = f"{Path(d['filepath']).stem}:{h}"
+                  structured["report_type"] = d["report_type"]
+                  structured["images"] = d["images"]
+                  structured["source_filename"] = Path(d["filepath"]).name
+                  transformed_results.append(structured)
+                  logger.info(f"Transformed: {structured.get('patient_name')} [{structured['report_type']}]")
+              return transformed_results
+
+          results = asyncio.run(_run())
+
+      with open("transformed_documents.json", "w") as f:
+          json.dump(results, f)
+    outputFiles:
+      - transformed_documents.json
+
+  # -------------------------------------------------------------------
+  # Step 4: Generate Wiki, Metadata Index, and Knowledge Graph
+  # -------------------------------------------------------------------
+  - id: generate_wiki_task
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    env:
+      WIKI_CONFIG: "{{ vars.wiki | json }}"
+      METADATA_CONFIG: "{{ vars.metadata | json }}"
+      NEO4J_CONFIG: "{{ vars.neo4j | json }}"
+    inputFiles:
+      transformed_documents.json: "{{ outputs.transform_documents_task.outputFiles['transformed_documents.json'] }}"
+    script: |
+      import sys
+      import json
+      import logging
+      import asyncio
+      import os
+      from pathlib import Path
+
+      _AI_PLATFORM = Path("/app/aipipeline")
+      if str(_AI_PLATFORM) not in sys.path:
+          sys.path.insert(0, str(_AI_PLATFORM))
+
+      from src.components.generators.wiki_generator_wrapper import WikiGenerator
+      from src.components.metadata.json_repository import JsonMetadataRepository
+      from src.components.metadata.generator import MetadataGenerator
+      from src.components.graphbuilder.graphify_builder import GraphifyyBuilder
+      from src.components.graphbuilder.medical_graph_builder import MedicalGraphBuilder
+      from src.components.graphbuilder.repository.neo4j_repository import Neo4jGraphRepository
+      from src.components.connectors.neo4j import Neo4jConnector
+
+      logger = logging.getLogger(__name__)
+
+      with open("transformed_documents.json", "r") as f:
+          docs = json.load(f)
+
+      if docs:
+          wiki_cfg = json.loads(os.environ["WIKI_CONFIG"])
+          meta_cfg = json.loads(os.environ["METADATA_CONFIG"])
+          neo4j_cfg = json.loads(os.environ["NEO4J_CONFIG"])
+
+          wiki_dir = Path(wiki_cfg.get("output_dir", "/app/aipipeline/data/storage/wiki"))
+          meta_path = meta_cfg.get("index_path", "/app/aipipeline/data/storage/metadata/index.json")
+
+          wiki = WikiGenerator({"base_dir": str(wiki_dir)})
+          meta_gen = MetadataGenerator()
+          repo = JsonMetadataRepository(Path(meta_path))
+          graph = GraphifyyBuilder({"target_dir": str(wiki_dir)})
+
+          neo4j_repo = None
+          if neo4j_cfg.get("uri"):
+              neo4j_connector = Neo4jConnector(neo4j_cfg)
+              neo4j_repo = Neo4jGraphRepository(neo4j_connector)
+              logger.info("Neo4j: enabled")
+
+          async def _run():
+              for doc in docs:
+                  wiki.generate(doc, doc.get("source_filename", ""))
+                  for entry in meta_gen.generate(doc):
+                      await repo.upsert(entry)
+              await repo._flush()
+              try:
+                  graph.build_from_documents(docs)
+                  logger.info("Knowledge graph built (JSON).")
+                  if neo4j_repo:
+                      builder = MedicalGraphBuilder()
+                      neo4j_graph = builder.build(docs)
+                      neo4j_repo.save(neo4j_graph)
+                      logger.info("Knowledge graph saved to Neo4j.")
+              except Exception as e:
+                  logger.error(f"Graph build failed: {e}")
+
+          asyncio.run(_run())
+
+# -------------------------------------------------------------------
+# Schedule Trigger (@hourly)
+# -------------------------------------------------------------------
+triggers:
+  - id: hourly_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "@hourly"

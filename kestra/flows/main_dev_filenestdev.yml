@@ -1,0 +1,271 @@
+id: filenestdev
+namespace: dev
+description: "FileNest pipeline: checks fhir-staging for pending records and processes medical files dynamically"
+
+inputs:
+  - id: fhir_staging_base_url
+    type: STRING
+    defaults: "{{ kv('FHIR_STAGING_BASE_URL') }}"
+    description: "Base URL for fhir-staging service"
+
+  - id: filenest_api_url
+    type: STRING
+    defaults: "{{ kv('FILENEST_API_URL') }}"
+    description: "Base URL for FileNest service"
+
+  - id: filenest_api_key
+    type: STRING
+    defaults: "{{ kv('FILENEST_API_KEY') }}"
+    description: "FileNest API Key"
+
+  - id: filenest_project_id
+    type: STRING
+    defaults: "{{ kv('FILENEST_PROJECT_ID') }}"
+    description: "FileNest Project ID"
+
+  - id: openai_api_key
+    type: STRING
+    defaults: "{{ kv('OPENAI_API_KEY') }}"
+    description: "OpenAI API Key"
+
+triggers:
+  - id: schedule_check_pending
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 0 * * *"
+
+tasks:
+  # -------------------------------------------------------------------------
+  # 1. Fetch pending records from fhir-staging
+  # -------------------------------------------------------------------------
+  - id: fetch_pending_records
+    type: io.kestra.plugin.core.http.Request
+    uri: "{{ inputs.fhir_staging_base_url }}/api/v1/staging-records/?status=pending"
+    method: GET
+    contentType: application/json
+    options:
+      allowFailed: true
+
+  # -------------------------------------------------------------------------
+  # 2. Extract and filter PDF records
+  # -------------------------------------------------------------------------
+  - id: filter_pending_records
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    inputFiles:
+      pending_response.json: "{{ outputs.fetch_pending_records.body }}"
+    script: |
+      import json
+      from kestra import Kestra
+
+      with open("pending_response.json", "r", encoding="utf-8") as f:
+          content = f.read().strip()
+          try:
+              data = json.loads(content) if content else {}
+          except Exception:
+              data = {}
+
+      records = data.get("data", []) if isinstance(data, dict) else []
+      valid_records = []
+      for r in records:
+          staging_id = r.get("staging_record_id") or r.get("id")
+          file_id = r.get("file_id")
+          filename = r.get("attachment_title") or r.get("filename") or file_id or "document.pdf"
+          content_type = (r.get("attachment_content_type") or r.get("content_type") or "").lower()
+
+          # Match main_default_filenest.yml: process PDF records only
+          is_pdf = filename.lower().endswith(".pdf") or "pdf" in content_type
+          if staging_id and file_id and is_pdf:
+              valid_records.append({
+                  "staging_record_id": str(staging_id),
+                  "file_id": str(file_id),
+                  "filename": filename if filename.lower().endswith(".pdf") else f"{filename}.pdf",
+                  "patient_id": str(r.get("patient_id") or ""),
+                  "encounter_id": str(r.get("encounter_id") or ""),
+                  "service_request_id": str(r.get("service_request_id") or ""),
+              })
+
+      print(f"Total pending: {len(records)}, PDF pending: {len(valid_records)}")
+      Kestra.outputs({"records": valid_records, "has_records": len(valid_records) > 0})
+
+  # -------------------------------------------------------------------------
+  # 3. Process each fetched record in loop
+  # -------------------------------------------------------------------------
+  - id: process_each_record
+    type: io.kestra.plugin.core.flow.Loop
+    values: "{{ outputs.filter_pending_records.vars.records }}"
+    tasks:
+      # Step A: Update status to 'processing'
+      - id: update_status_to_processing
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ inputs.fhir_staging_base_url }}/api/v1/staging-records/{{ fromJson(item.value).staging_record_id }}"
+        method: PATCH
+        contentType: application/json
+        body: |
+          {
+            "status": "processing",
+            "updated_by": "kestra-filenest"
+          }
+
+      # Step B1: Retrieve fresh staging record details (matches FhirStagingClient.get_staging_record)
+      - id: get_staging_record_details
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ inputs.fhir_staging_base_url }}/api/v1/staging-records/{{ fromJson(item.value).staging_record_id }}"
+        method: GET
+        contentType: application/json
+
+      # Step B2: Request presigned FileNest download URL (matches FileNest SDK files.get_download_url)
+      - id: get_filenest_download_url
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ inputs.filenest_api_url }}/v1/projects/{{ inputs.filenest_project_id }}/files/{{ fromJson(outputs.get_staging_record_details.body).file_id | default(fromJson(item.value).file_id) }}/download?ttl=3600"
+        method: GET
+        headers:
+          Authorization: "Bearer {{ inputs.filenest_api_key }}"
+          Accept: "application/json"
+
+      # Step B3: Download actual file bytes from presigned URL into Kestra internal storage
+      - id: download_filenest_file
+        type: io.kestra.plugin.core.http.Download
+        uri: "{{ fromJson(outputs.get_filenest_download_url.body).url }}"
+
+      # Step C: Extract document text using Apache Tika (replaces local PDF extractor + cleanup)
+      - id: extract_document_content
+        type: io.kestra.plugin.tika.Parse
+        from: "{{ outputs.download_filenest_file.uri }}"
+        contentType: TEXT
+        store: false
+
+      # Step D: Classify report type using OpenAI plugin with MedicalClassifier classes & rules
+      - id: classify_document
+        type: io.kestra.plugin.openai.ChatCompletion
+        apiKey: "{{ inputs.openai_api_key }}"
+        model: gpt-4o-mini
+        prompt: |
+          You are a Medical Document Classifier. Given the beginning of a medical document, identify its report type.
+          Return ONLY one of these exact class names (no JSON, no punctuation, no explanation):
+          mri, ct, xray, ultrasound, ecg, blood_report, lab_report, prescription, discharge_summary, consultation, operative_report, histopathology, microbiology, other
+
+          Rules:
+          - Lab values with reference ranges -> blood_report
+          - ECG measurements (PR interval, QRS duration, QT interval) -> ecg
+          - MRI sequences (T1-weighted, T2-weighted, STIR, FLAIR) -> mri
+          - CT-specific terms (Hounsfield units, axial/sagittal cuts) -> ct
+          - X-ray specific (PA view, lateral view) -> xray
+          - Medication lists with dosage -> prescription
+          - Admission date, discharge date, hospital course -> discharge_summary
+          - Surgical procedure, anesthesia, operative findings -> operative_report
+          - Specimen, gross description, microscopic examination -> histopathology
+          - Organism identification, sensitivity panel -> microbiology
+          - If empty or uncertain -> other
+
+          Content:
+          {{ outputs.extract_document_content.result.content | default('') | abbreviate(800) }}
+
+      # Step E: Transform clinical domain model JSON (Python)
+      - id: transform_clinical_domain
+        type: io.kestra.plugin.scripts.python.Script
+        taskRunner:
+          type: io.kestra.plugin.core.runner.Process
+        env:
+          OPENAI_API_KEY: "{{ inputs.openai_api_key }}"
+          REPORT_TYPE: "{{ outputs.classify_document.choices[0].message.content | default('other') }}"
+          ITEM_FILENAME: "{{ fromJson(item.value).filename }}"
+          ITEM_FILE_ID: "{{ fromJson(item.value).file_id }}"
+          ITEM_PATIENT_ID: "{{ fromJson(item.value).patient_id }}"
+        inputFiles:
+          document_content.txt: "{{ outputs.extract_document_content.result.content | default('') }}"
+          staging_record.json: "{{ outputs.get_staging_record_details.body }}"
+        outputFiles:
+          - clinical_document.json
+        script: |
+          import asyncio
+          import json
+          import os
+          import sys
+          from pathlib import Path
+          from kestra import Kestra
+
+          container_path = Path("/app/aipipeline")
+          host_path = Path("/home/logidhasan/data/github/drgodly/aipipeline")
+          AI_PLATFORM = container_path if container_path.exists() else host_path
+          if str(AI_PLATFORM) not in sys.path:
+              sys.path.insert(0, str(AI_PLATFORM))
+
+          from src.components.transformers.factory import TransformerFactory
+          from src.components.fhir_staging.mapper import StagingObservationMapper
+          from src.components.utils.config import PipelineConfig
+
+          VALID_REPORT_TYPES = {
+              "mri", "ct", "xray", "ultrasound", "ecg", "blood_report", "lab_report",
+              "prescription", "discharge_summary", "consultation", "operative_report",
+              "histopathology", "microbiology", "other",
+          }
+
+          settings = PipelineConfig()
+          api_key = os.getenv("OPENAI_API_KEY") or settings.OPENAI_API_KEY
+
+          transformer_config = settings.get_transformer_config()
+          transformer_config["api_key"] = api_key
+          transformer = TransformerFactory.get_transformer("medical", config=transformer_config)
+
+          markdown = Path("document_content.txt").read_text(encoding="utf-8")
+          record_details = json.loads(Path("staging_record.json").read_text(encoding="utf-8") or "{}")
+
+          file_id = record_details.get("file_id") or os.getenv("ITEM_FILE_ID", "")
+          filename = (
+              record_details.get("attachment_title")
+              or record_details.get("filename")
+              or os.getenv("ITEM_FILENAME", "")
+              or f"{file_id}.pdf"
+          )
+          if not filename.lower().endswith(".pdf"):
+              filename = f"{filename}.pdf"
+
+          patient_id = str(record_details.get("patient_id") or os.getenv("ITEM_PATIENT_ID", ""))
+          raw_report_type = (os.getenv("REPORT_TYPE") or "other").strip().lower()
+          report_type = raw_report_type if raw_report_type in VALID_REPORT_TYPES else "other"
+
+          document = asyncio.run(transformer.transform(markdown, dicom_metadata=None))
+          document["report_type"] = report_type
+          document["source_file"] = filename
+          document["filenest_file_id"] = file_id
+          document["patient_id"] = patient_id
+
+          # Persist to destination storage
+          out_dir = AI_PLATFORM / "storage" / "emr" / "transformed"
+          out_dir.mkdir(parents=True, exist_ok=True)
+          file_id_short = file_id[:8] if file_id else "unknown"
+          file_stem = Path(filename).stem if filename else "document"
+          out_path = out_dir / f"{file_stem}_{file_id_short}.json"
+
+          doc_json = json.dumps(document, indent=2, ensure_ascii=False, default=str)
+          out_path.write_text(doc_json, encoding="utf-8")
+
+          with open("clinical_document.json", "w", encoding="utf-8") as f:
+              f.write(doc_json)
+
+          mapper = StagingObservationMapper()
+          mapped_observations = [
+              mapper.map(obs) for obs in document.get("observations", []) if isinstance(obs, dict)
+          ]
+
+          print(f"Persisted to {out_path} with {len(mapped_observations)} observations")
+          Kestra.outputs({
+              "output_path": str(out_path),
+              "summary": document.get("summary", ""),
+              "observations": mapped_observations,
+          })
+
+      # Step F: Patch staging record to 'completed'
+      - id: patch_staging_completed
+        type: io.kestra.plugin.core.http.Request
+        uri: "{{ inputs.fhir_staging_base_url }}/api/v1/staging-records/{{ fromJson(item.value).staging_record_id }}"
+        method: PATCH
+        contentType: application/json
+        body: |
+          {
+            "status": "completed",
+            "updated_by": "kestra-filenest",
+            "summary": {{ outputs.transform_clinical_domain.vars.summary | toJson }},
+            "observations": {{ outputs.transform_clinical_domain.vars.observations | toJson }}
+          }

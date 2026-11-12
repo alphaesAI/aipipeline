@@ -1,0 +1,225 @@
+id: gmailpipeline
+namespace: default
+
+description: "Orchestrates Gmail data flow using native Kestra Flow Variables: Extraction -> Transformation -> Embedding -> Loading."
+
+# -------------------------------------------------------------------
+# Pipeline Configuration defined via Flow Variables
+# -------------------------------------------------------------------
+variables:
+  gmail_pipeline:
+    extraction:
+      query: "is:unread"
+      batch_size: 10
+      fields: 
+        - "subject"
+        - "from"
+        - "date"
+      extraction_mode: "full"
+
+    transformation:
+      index_name: "gmail_index"
+      textractor:
+        paragraphs: true
+        sections: true
+      segmentation:
+        sentences: true
+        minlength: 20
+        maxlength: 512
+
+    embeddings:
+      path: "sentence-transformers/all-MiniLM-L6-v2"
+      content: true
+      backend: "annoy"
+      
+    load:
+      index_name: "gmail_index"
+      settings:
+        index:
+          number_of_shards: 1
+          number_of_replicas: 0
+        analysis:
+          analyzer:
+            gmail_analyzer:
+              type: custom
+              tokenizer: standard
+              filter: ["lowercase", "stop", "snowball"]
+      mappings:
+        dynamic: true
+        properties:
+          id: 
+            type: keyword
+          source_id: 
+            type: keyword
+          source: 
+            type: keyword
+          text: 
+            type: text
+            analyzer: gmail_analyzer
+          embedding: 
+            type: dense_vector
+            dims: 384
+            index: true
+            similarity: cosine
+          metadata:
+            type: object
+
+tasks:
+  # -------------------------------------------------------------------
+  # Step 1: Extraction Task
+  # -------------------------------------------------------------------
+  - id: extract_gmail_data
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    env:
+      PYTHONPATH: "/app/aipipeline"
+      GMAIL_CLIENT_ID: "{{ secret('GMAIL_CLIENT_ID') }}"
+      GMAIL_CLIENT_SECRET: "{{ secret('GMAIL_CLIENT_SECRET') }}"
+      GMAIL_REFRESH_TOKEN: "{{ secret('GMAIL_REFRESH_TOKEN') }}"
+      EXTRACTION_CONFIG: "{{ vars.gmail_pipeline.extraction | toJson }}"
+    script: |
+      import json
+      import logging
+      import os
+      from src.components.connectors.factory import ConnectorFactory
+      from src.components.extractors.factory import ExtractorFactory
+
+      logger = logging.getLogger(__name__)
+
+      creds = {
+          "client_id": os.environ.get("GMAIL_CLIENT_ID"),
+          "client_secret": os.environ.get("GMAIL_CLIENT_SECRET"),
+          "refresh_token": os.environ.get("GMAIL_REFRESH_TOKEN")
+      }
+
+      extraction_config = json.loads(os.environ["EXTRACTION_CONFIG"])
+
+      connector = ConnectorFactory.get_connector(connector_type="gmail", config=creds)
+      service = connector()
+
+      extractor = ExtractorFactory.get_extractor("gmail", service, extraction_config)
+      data = list(extractor.extract())
+
+      logger.info(f"Extracted {len(data)} records from Gmail.")
+
+      with open("raw_records.json", "w") as f:
+          json.dump(data, f)
+    outputFiles:
+      - raw_records.json
+
+  # -------------------------------------------------------------------
+  # Step 2: Transformation Task
+  # -------------------------------------------------------------------
+  - id: transform_data
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    env:
+      PYTHONPATH: "/app/aipipeline"
+      TRANSFORMATION_CONFIG: "{{ vars.gmail_pipeline.transformation | toJson }}"
+    inputFiles:
+      raw_records.json: "{{ outputs.extract_gmail_data.outputFiles['raw_records.json'] }}"
+    script: |
+      import json
+      import os
+      from src.components.transformers.factory import TransformerFactory
+
+      with open("raw_records.json") as f:
+          raw_records = json.load(f)
+
+      trans_config = json.loads(os.environ["TRANSFORMATION_CONFIG"])
+
+      transformer = TransformerFactory.get_transformer(
+          transformer_type="document",
+          data=raw_records,
+          config=trans_config
+      )
+      chunks = list(transformer())
+
+      with open("transformed_chunks.json", "w") as f:
+          json.dump(chunks, f)
+    outputFiles:
+      - transformed_chunks.json
+
+  # -------------------------------------------------------------------
+  # Step 3: Embedding Task
+  # -------------------------------------------------------------------
+  - id: generate_embeddings
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    env:
+      PYTHONPATH: "/app/aipipeline"
+      EMBEDDINGS_CONFIG: "{{ vars.gmail_pipeline.embeddings | toJson }}"
+    inputFiles:
+      transformed_chunks.json: "{{ outputs.transform_data.outputFiles['transformed_chunks.json'] }}"
+    script: |
+      import json
+      import os
+      from src.components.embedder.factory import EmbedderFactory
+
+      with open("transformed_chunks.json") as f:
+          chunks = json.load(f)
+
+      embed_config = json.loads(os.environ["EMBEDDINGS_CONFIG"])
+
+      embedder = EmbedderFactory.get_embedder(embedder_type="txtai", data=chunks, config=embed_config)
+      embedded_chunks = list(embedder.embed())
+
+      with open("embedded_chunks.json", "w") as f:
+          json.dump(embedded_chunks, f)
+    outputFiles:
+      - embedded_chunks.json
+
+  # -------------------------------------------------------------------
+  # Step 4: Loading Task (Elasticsearch)
+  # -------------------------------------------------------------------
+  - id: load_to_es
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    env:
+      PYTHONPATH: "/app/aipipeline"
+      ES_HOST: "{{ secret('ES_HOST') }}"
+      ES_PORT: "{{ secret('ES_PORT') }}"
+      ES_LOGIN: "{{ secret('ES_LOGIN') }}"
+      ES_PASSWORD: "{{ secret('ES_PASSWORD') }}"
+      LOAD_CONFIG: "{{ vars.gmail_pipeline.load | toJson }}"
+    inputFiles:
+      embedded_chunks.json: "{{ outputs.generate_embeddings.outputFiles['embedded_chunks.json'] }}"
+    script: |
+      import json
+      import logging
+      import os
+      from src.components.connectors.factory import ConnectorFactory
+      from src.components.loaders.factory import LoaderFactory
+
+      logger = logging.getLogger(__name__)
+
+      with open("embedded_chunks.json") as f:
+          enriched_data = json.load(f)
+
+      es_creds = {
+          "host": os.environ.get("ES_HOST"),
+          "port": int(os.environ["ES_PORT"]) if os.environ.get("ES_PORT") else None,
+          "login": os.environ.get("ES_LOGIN"),
+          "password": os.environ.get("ES_PASSWORD")
+      }
+
+      load_config = json.loads(os.environ["LOAD_CONFIG"])
+
+      connector = ConnectorFactory.get_connector(connector_type="elasticsearch", config=es_creds)
+      es_conn = connector()
+
+      loader = LoaderFactory.get_loader(load_type="elasticsearch", connection=es_conn, config=load_config)
+      loader(data=enriched_data)
+      logger.info("Gmail data loading complete.")
+
+# -------------------------------------------------------------------
+# Schedule Trigger (@monthly)
+# -------------------------------------------------------------------
+triggers:
+  - id: monthly_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "@monthly"

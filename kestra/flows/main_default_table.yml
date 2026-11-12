@@ -1,0 +1,202 @@
+id: table
+namespace: default
+
+description: Orchestrates RDBMS extraction, JSON transformation, and Elasticsearch loading using native Kestra Flow Variables.
+
+# -------------------------------------------------------------------
+# Pipeline Configuration defined via Flow Variables
+# -------------------------------------------------------------------
+variables:
+  postgres:
+    extraction:
+      source_name: "health_db"
+      tables:
+        - table_name: "users"
+          schema: "public"
+          columns: ["id", "username", "email", "created_at", "updated_at"]
+          extraction_mode: "incremental"
+          incremental_column: "updated_at"
+          batch_size: 10
+
+        - table_name: "orders"
+          schema: "public"
+          columns: ["order_id", "user_id", "order_date", "total_amount", "status"]
+          extraction_mode: "incremental"
+          incremental_column: "order_date"
+          batch_size: 10
+
+        - table_name: "products"
+          schema: "public"
+          columns: ["id", "name", "price", "stock", "created_at", "updated_at"]
+          extraction_mode: "full"
+          batch_size: 10
+
+  gmail:
+    extraction:
+      query: "has:attachment"
+      batch_size: 10
+      extraction_mode: full
+      fields: ["subject", "from", "to", "date"]
+      temp_dir: /data/gmail_attachments
+
+  elasticsearch:
+    load:
+      index_name: "health_data"
+      ingest_mode: single
+      settings:
+        index:
+          number_of_shards: 1
+          number_of_replicas: 0
+        analysis:
+          analyzer:
+            health_analyzer:
+              type: custom
+              tokenizer: standard
+              filter: ["lowercase", "stop", "snowball"]
+      mappings:
+        dynamic: true
+        properties:
+          patient_id: {type: keyword}
+          patient_name: {type: text, analyzer: health_analyzer}
+          diagnosis: {type: text}
+          visit_date: {type: date}
+          billing_amount: {type: float}
+
+tasks:
+  # -------------------------------------------------------------------
+  # Step 1: Extraction Task (PostgreSQL / RDBMS)
+  # -------------------------------------------------------------------
+  - id: extract_health_data
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    env:
+      POSTGRES_HOST: "{{ secret('POSTGRES_HOST') }}"
+      POSTGRES_PORT: "{{ secret('POSTGRES_PORT') }}"
+      POSTGRES_USER: "{{ secret('POSTGRES_USER') }}"
+      POSTGRES_PASSWORD: "{{ secret('POSTGRES_PASSWORD') }}"
+      POSTGRES_DB: "{{ secret('POSTGRES_DB') }}"
+      EXTRACTION_CONFIG: "{{ vars.postgres.extraction | json }}"
+    script: |
+      import json
+      import os
+      from src.components.connectors.factory import ConnectorFactory
+      from src.components.extractors.factory import ExtractorFactory
+
+      psql_creds = {
+          "host": os.environ.get("POSTGRES_HOST"),
+          "port": os.environ.get("POSTGRES_PORT"),
+          "user": os.environ.get("POSTGRES_USER"),
+          "password": os.environ.get("POSTGRES_PASSWORD"),
+          "database": os.environ.get("POSTGRES_DB")
+      }
+
+      config = json.loads(os.environ["EXTRACTION_CONFIG"])
+
+      connector = ConnectorFactory.get_connector(connector_type="rdbms", config=psql_creds)
+      connection = connector()
+
+      try:
+          extractor = ExtractorFactory.get_extractor(
+              extractor_type="rdbms", 
+              connection=connection, 
+              config=config
+          )
+          raw_data = extractor()
+      finally:
+          connection.close()
+
+      with open("raw_data.json", "w") as f:
+          json.dump(raw_data, f)
+    outputFiles:
+      - raw_data.json
+
+  # -------------------------------------------------------------------
+  # Step 2: Transformation Task
+  # -------------------------------------------------------------------
+  - id: transform_health_data
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    env:
+      TRANSFORM_CONFIG: "{{ vars.elasticsearch.load | json }}"
+    inputFiles:
+      raw_data.json: "{{ outputs.extract_health_data.outputFiles['raw_data.json'] }}"
+    script: |
+      import json
+      import os
+      from src.components.transformers.factory import TransformerFactory
+
+      with open("raw_data.json", "r") as f:
+          raw_data = json.load(f)
+
+      config = json.loads(os.environ["TRANSFORM_CONFIG"])
+
+      transformer = TransformerFactory.get_transformer(
+          transformer_type="json",
+          data=raw_data,
+          config=config
+      )
+      
+      transformed_data = list(transformer())
+
+      with open("transformed_data.json", "w") as f:
+          json.dump(transformed_data, f)
+    outputFiles:
+      - transformed_data.json
+
+  # -------------------------------------------------------------------
+  # Step 3: Loading Task (Elasticsearch)
+  # -------------------------------------------------------------------
+  - id: load_to_es
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    env:
+      ES_HOST: "{{ secret('ES_HOST') }}"
+      ES_PORT: "{{ secret('ES_PORT') }}"
+      ES_LOGIN: "{{ secret('ES_LOGIN') }}"
+      ES_PASSWORD: "{{ secret('ES_PASSWORD') }}"
+      LOAD_CONFIG: "{{ vars.elasticsearch.load | json }}"
+    inputFiles:
+      transformed_data.json: "{{ outputs.transform_health_data.outputFiles['transformed_data.json'] }}"
+    script: |
+      import json
+      import logging
+      import os
+      from src.components.connectors.factory import ConnectorFactory
+      from src.components.loaders.factory import LoaderFactory
+
+      logger = logging.getLogger(__name__)
+
+      with open("transformed_data.json", "r") as f:
+          transformed_data = json.load(f)
+
+      es_creds = {
+          "host": os.environ.get("ES_HOST"),
+          "port": int(os.environ["ES_PORT"]) if os.environ.get("ES_PORT") else None,
+          "login": os.environ.get("ES_LOGIN"),
+          "password": os.environ.get("ES_PASSWORD")
+      }
+
+      config = json.loads(os.environ["LOAD_CONFIG"])
+
+      connector = ConnectorFactory.get_connector(connector_type="elasticsearch", config=es_creds)
+      es_connection = connector()
+
+      loader = LoaderFactory.get_loader(
+          load_type="elasticsearch",
+          connection=es_connection,
+          config=config
+      )
+
+      loader(data=transformed_data)
+      logger.info("Health data ingestion successful.")
+
+# -------------------------------------------------------------------
+# Schedule Trigger (@monthly)
+# -------------------------------------------------------------------
+triggers:
+  - id: monthly_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "@monthly"

@@ -1,0 +1,252 @@
+id: arxiv
+namespace: default
+
+description: Orchestrates Arxiv flow using native Kestra Flow Variables and Elasticsearch plugin.
+
+variables:
+  arxiv:
+    base_url: "https://export.arxiv.org/api/query"
+    timeout: 30
+    search_category: "cs.AI"
+    max_results: 3
+    rate_limit_delay: 3.0
+    namespaces:
+      atom: "http://www.w3.org/2005/Atom"
+      opensearch: "http://a9.com/-/spec/opensearch/1.1/"
+      arxiv: "http://arxiv.org/schemas/atom"
+    download_dir: "/tmp/aiplatform/arxiv/downloads"
+    max_retries: 3
+    retry_backoff: 2
+    timeout_seconds: 30
+
+  docling:
+    index_name: "arxiv_papers"
+    max_pages: 30
+    max_file_size_mb: 50
+    max_concurrency: 4
+    do_ocr: false
+    do_table_structure: false
+
+  chunker:
+    index_name: "arxiv_chunks"
+    chunking:
+      chunk_size: 600
+      overlap_size: 120
+      min_chunk_size: 150
+
+  elasticsearch:
+    load:
+      index_name: "arxiv_chunks"
+      settings:
+        index:
+          number_of_shards: 1
+          number_of_replicas: 0
+        analysis:
+          analyzer:
+            arxiv_analyzer:
+              type: custom
+              tokenizer: standard
+              filter: ["lowercase", "stop", "snowball"]
+      mappings:
+        dynamic: true
+        properties:
+          title: {type: text, analyzer: arxiv_analyzer}
+          abstract: {type: text, analyzer: arxiv_analyzer}
+          text: {type: text, analyzer: arxiv_analyzer}
+          vector: {type: dense_vector, dims: 384}
+
+  embeddings:
+    path: "sentence-transformers/all-MiniLM-L6-v2"
+    content: true
+    backend: "annoy"
+
+tasks:
+  - id: extract_pdfs
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    namespaceFiles:
+      enabled: true
+    env:
+      ARXIV_CONFIG: "{{ vars.arxiv | toJson }}"
+    script: |
+      import sys
+      from pathlib import Path
+
+      container_path = Path("/app/aipipeline")
+      host_path = Path("/home/logidhasan/data/github/drgodly/aipipeline")
+
+      if container_path.exists() and str(container_path) not in sys.path:
+          sys.path.insert(0, str(container_path))
+      elif host_path.exists() and str(host_path) not in sys.path:
+          sys.path.insert(0, str(host_path))
+
+      import asyncio
+      import logging
+      import json
+      import os
+      from src.components.connectors.factory import ConnectorFactory
+      from src.components.extractors.factory import ExtractorFactory
+
+      logger = logging.getLogger(__name__)
+
+      config = json.loads(os.environ["ARXIV_CONFIG"])
+
+      connector = ConnectorFactory.get_connector(connector_type="arxiv", config=config)
+      extractor = ExtractorFactory.get_extractor(
+          extractor_type="arxiv",
+          connection=connector,
+          config=config
+      )
+
+      papers = asyncio.run(extractor.extract())
+      logger.info(f"Extracted {len(papers)} papers from Arxiv.")
+
+      with open("papers.json", "w") as f:
+          json.dump(papers, f)
+    outputFiles:
+      - papers.json
+
+  - id: pdf_to_structured_content
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    namespaceFiles:
+      enabled: true
+    env:
+      DOCLING_CONFIG: "{{ vars.docling | toJson }}"
+    inputFiles:
+      papers.json: "{{ outputs.extract_pdfs.outputFiles['papers.json'] }}"
+    script: |
+      import sys
+      from pathlib import Path
+
+      container_path = Path("/app/aipipeline")
+      host_path = Path("/home/logidhasan/data/github/drgodly/aipipeline")
+
+      if container_path.exists() and str(container_path) not in sys.path:
+          sys.path.insert(0, str(container_path))
+      elif host_path.exists() and str(host_path) not in sys.path:
+          sys.path.insert(0, str(host_path))
+
+      import asyncio
+      import json
+      import os
+      from src.components.transformers.factory import TransformerFactory
+
+      with open("papers.json") as f:
+          papers = json.load(f)
+
+      config = json.loads(os.environ["DOCLING_CONFIG"])
+      transformer = TransformerFactory.get_transformer(
+          transformer_type="pdf",
+          data=papers,
+          config=config
+      )
+
+      structured_data = asyncio.run(transformer())
+
+      with open("structured_data.json", "w") as f:
+          json.dump(structured_data, f)
+    outputFiles:
+      - structured_data.json
+
+  - id: chunk_structured_content
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    namespaceFiles:
+      enabled: true
+    env:
+      CHUNKER_CONFIG: "{{ vars.chunker | toJson }}"
+    inputFiles:
+      structured_data.json: "{{ outputs.pdf_to_structured_content.outputFiles['structured_data.json'] }}"
+    script: |
+      import sys
+      from pathlib import Path
+
+      container_path = Path("/app/aipipeline")
+      host_path = Path("/home/logidhasan/data/github/drgodly/aipipeline")
+
+      if container_path.exists() and str(container_path) not in sys.path:
+          sys.path.insert(0, str(container_path))
+      elif host_path.exists() and str(host_path) not in sys.path:
+          sys.path.insert(0, str(host_path))
+
+      import json
+      import os
+      from src.components.transformers.factory import TransformerFactory
+
+      with open("structured_data.json") as f:
+          structured_data = json.load(f)
+
+      config = json.loads(os.environ["CHUNKER_CONFIG"])
+      chunker = TransformerFactory.get_transformer(
+          transformer_type="chunker",
+          data=structured_data,
+          config=config
+      )
+
+      chunks = list(chunker())
+
+      with open("chunks.json", "w") as f:
+          json.dump(chunks, f)
+    outputFiles:
+      - chunks.json
+
+  - id: embed_chunks
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+      type: io.kestra.plugin.core.runner.Process
+    namespaceFiles:
+      enabled: true
+    env:
+      EMBEDDINGS_CONFIG: "{{ vars.embeddings | toJson }}"
+    inputFiles:
+      chunks.json: "{{ outputs.chunk_structured_content.outputFiles['chunks.json'] }}"
+    script: |
+      import sys
+      from pathlib import Path
+
+      container_path = Path("/app/aipipeline")
+      host_path = Path("/home/logidhasan/data/github/drgodly/aipipeline")
+
+      if container_path.exists() and str(container_path) not in sys.path:
+          sys.path.insert(0, str(container_path))
+      elif host_path.exists() and str(host_path) not in sys.path:
+          sys.path.insert(0, str(host_path))
+
+      import json
+      import logging
+      import os
+      from src.components.embedder.factory import EmbedderFactory
+
+      logger = logging.getLogger(__name__)
+
+      with open("chunks.json") as f:
+          chunks = json.load(f)
+
+      config = json.loads(os.environ["EMBEDDINGS_CONFIG"])
+      embedder = EmbedderFactory.get_embedder(embedder_type="txtai", data=chunks, config=config)
+      embedded_chunks = list(embedder.embed())
+
+      with open("embedded_chunks.json", "w") as f:
+          json.dump(embedded_chunks, f)
+    outputFiles:
+      - embedded_chunks.json
+
+  - id: load_to_elasticsearch
+    type: io.kestra.plugin.elasticsearch.Load
+    connection:
+      hosts:
+        - "http://{{ secret('ES_HOST') }}:{{ secret('ES_PORT') }}"
+      basicAuth:
+        username: "{{ secret('ES_LOGIN') }}"
+        password: "{{ secret('ES_PASSWORD') }}"
+    from: "{{ outputs.embed_chunks.outputFiles['embedded_chunks.json'] }}"
+    index: "{{ vars.elasticsearch.load.index_name }}"
+
+triggers:
+  - id: monthly_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "@monthly"
