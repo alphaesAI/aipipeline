@@ -212,3 +212,4 @@ __marimo__/
 
 secrets/
 static/.env_encoded
+.env_encoded
