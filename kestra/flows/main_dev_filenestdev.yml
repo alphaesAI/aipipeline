@@ -269,3 +269,15 @@ tasks:
             "summary": {{ outputs.transform_clinical_domain.vars.summary | toJson }},
             "observations": {{ outputs.transform_clinical_domain.vars.observations | toJson }}
           }
+
+      # Step G: Clean up temporary downloaded file from internal storage
+      - id: cleanup_temp_file
+        type: io.kestra.plugin.core.storage.Delete
+        uri: "{{ outputs.download_filenest_file.uri }}"
+        errorOnMissing: false
+
+      # Step G: Clean up temporary downloaded file from internal storage
+      - id: cleanup_temp_file
+        type: io.kestra.plugin.core.storage.Delete
+        uri: "{{ outputs.download_filenest_file.uri }}"
+        errorOnMissing: false
